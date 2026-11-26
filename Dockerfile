@@ -1,0 +1,44 @@
+# Images are pinned by digest (Renovate bumps tag and digest together): a re-pushed tag cannot
+# change what gets built.
+# Builder, runtime and development.Dockerfile share one Debian release (13 "trixie"), so the
+# binary links against the glibc and OpenSSL the runtime image ships (MAIR-741: Debian 12's
+# distroless libssl3 is unpatched).
+FROM rust:1.100-slim-trixie@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/app
+
+# --- DEPENDENCY CACHE ---
+# Build the dependencies alone first: this layer stays cached as long as Cargo.toml and Cargo.lock
+# do not change, so a code change only recompiles the API itself.
+# `--locked`: build exactly the reviewed `Cargo.lock`, fail instead of resolving new versions.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs && touch src/lib.rs \
+    && cargo build --release --locked \
+    && rm -rf src
+# -----------------------------
+
+COPY . .
+# Make sure cargo rebuilds the crate instead of keeping the placeholder built above.
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+
+# --- Stage 2: runtime (distroless, non-root) ---
+# The `nonroot` variant runs as uid/gid 65532. `USER` is repeated numerically so
+# Kubernetes can enforce `runAsNonRoot: true`. The API binds an unprivileged
+# port (`PORT`, 3000+) and never writes to the filesystem. The binary stays
+# owned by root (read + execute only for the runtime user).
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:29ee70762214fe8190cea04ef1c0a84a8365879e047ce8f911ae5a5ab2355fa2
+WORKDIR /app
+
+# change api name
+COPY --from=builder /usr/src/app/target/release/api_template /app/template-api
+
+USER 65532:65532
+
+# change api name
+CMD ["/app/template-api"]

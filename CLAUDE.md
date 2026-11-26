@@ -1,0 +1,259 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+`API_template` is the scaffold every Mairie 360 Rust API (`Core_API`, `Project_API`, `Calendar_API`,
+`Message_API`, `ELearning_API`) was generated from. Keep it in sync with those siblings: when a
+shared pattern changes there (lib version, `main.rs` bootstrap, Docker/compose files, CI
+workflow, Renovate config), port it here. The crate is `api_template`; every spot a new API must
+rename carries a `change api name` / `change port` marker, on the same line (or on the line just
+above in the `Dockerfile`s, which forbid trailing comments). Any API name, port or URL added to the
+template must get one. The API's Postgres role (`core_api` as a placeholder, the template has none of its own)
+carries a `change api role` marker: `tests/common/mod.rs::API_DB_ROLE`, `tests/db_role_test.rs` and `DB_USER` /
+`DB_PASSWORD` in the four compose files, plus the `-D<role>_password` passed to Liquibase right below them (a
+folded `command:` cannot hold a comment). The template ships no business endpoint on purpose (`v1` is an empty scope).
+
+## Commands
+
+Same aliases as the siblings (`.cargo/config.toml`): `cargo lint_check`, `cargo lint_fix`,
+`cargo check_code` (clippy `-D warnings`), `cargo test` (Docker + GHCR pull access, testcontainers
+via `mairie360_api_lib::test_setup::queries_setup::get_shared_db`), `cargo cov_test` (60 % line
+gate, only `main.rs` and `lib.rs` excluded: handlers and validation count, test them), `cargo open_api`
+(OpenAPI JSON on stdout).
+
+Tests run the code as the API's own Postgres role, like in staging (MAIR-556). `get_shared_db()` hands back the
+**superuser** URL of the shared testcontainer, for fixtures only (creating, seeding, granting a probe table); the
+code under test (`AppState`, query views) connects with `tests/common::api_db_url()`, i.e. the lib's
+`get_shared_db_as(API_DB_ROLE)` (`http_setup::test_app_state_as` for endpoint tests). A query outside the grants of
+Database's `api_grants.sql` then fails the test with `permission denied` (SQLSTATE `42501`): add the grant there,
+never connect the code under test as the superuser. `tests/db_role_test.rs` checks the role is the one in use, not
+a superuser, and is refused a table it is not granted (pick one for the new API's role). The compose stacks connect
+the API as its role too (`-D<role>_password` passed to Liquibase, Database image `3.4.0` or later);
+postgres, liquibase and the seeder keep the superuser.
+
+Tests run in parallel (MAIR-1002): there is no `#[serial]`. The tests share the seeded database of
+`get_shared_db()` and keep to rows of their own (unique markers). A test that depends on, or changes, what the
+others see (a count of administrators, the whole `users` table, a sequence reset, a migration over every account)
+takes a database of its own with `mairie360_api_lib::test_setup::isolated::isolated_db()`: a copy of the seeded
+template (about 0.2 s), dropped when the guard is dropped, whose URLs are `db.url()` (superuser, fixtures) and
+`db.url_as("<role>")`. `isolated_redis()` gives a Redis client with its own key prefix on one container shared by
+the process. Only a test that sets a process environment variable keeps `#[serial(<group>)]`. The dependencies are
+compiled with `opt-level = 3` (`[profile.dev.package."*"]`): the code of the crate stays in debug, which is what the
+coverage measures, while argon2 and the TLS stack no longer dominate the run.
+
+`tests/queries/mod.rs` is empty on purpose (MAIR-533): the `integration_test` binary has no test until the API gets its
+first query view, and each view then adds a `mod <name>;` there with a test against the database. An empty binary proves
+nothing; `routing_test.rs` fails when the contract has no operation, so a scaffold without routes cannot pass silently.
+
+Access denials are tested, not assumed (MAIR-419): `tests/auth_gate_test.rs` checks the JWT gate in front of
+`/api` (no token, forged, expired, malformed, unknown or archived account, percent-encoded path; an HS256 token or one without Core's audience since MAIR-680). The lib answers
+`401` for a bad token and `404` for a well-signed token naming an unknown or archived account. Every new endpoint
+adds its own negative tests next to the positive ones: non-admin on an admin route, another user reading /
+modifying / deleting the resource, an id in the body that differs from the id in the URL.
+
+End-to-end harnesses (what CI runs on `main` after the dev release; each spins up its own stack from a
+standalone compose file, so env/image changes must be mirrored in all of them): `./integration_test.sh`
+(`docker-compose-integration.yml`, newman replaying `tests/postman/collection.json` with
+`tests/postman/environment.json`), `./security_test.sh` (ZAP), `./performance_test.sh` (k6). The
+collection is a Postman v2.1 export; `integration_test.sh` signs its EdDSA JWTs with the run's key
+(`test_secrets.sh`, the Postman sandbox cannot sign EdDSA) and the compose file passes them with `--env-var`:
+`jwt_admin` for the seeded Admin, `jwt_agent` for user 2 from `init-test.sql`, plus `jwt_forged` (Core's `kid`,
+another key) and `jwt_expired`; the pre-request script only forges `jwt_hs256`, which must be refused (MAIR-680).
+A new API only adds requests for its endpoints. `baseUrl` is
+overridden with `--env-var` by the compose file; the committed default targets `localhost:3000`.
+
+Split of the tests (MAIR-262), the same in every API: `cargo test` (unit and handler tests) validates the code,
+newman validates that the running image works. A generated API's collection holds, for **every operation of its
+spec**, the success case and one case per documented `400` / `401` / `403` / `404` / `409` / `412`, chained in
+business journeys; `429` / `500` / `502` / `503` stay in the handler tests. Three collection-level scripts, kept
+identical in every API collection (copy them from here or from a sibling, never fork them), back it:
+
+- the collection pre-request loads `/api-docs/openapi.json` once, and the collection test checks every answer
+  against it: documented operation, documented status, content type, and the JSON body against the response schema
+  (`$ref`s inlined). A request opts out with `pm.variables.set('openapi_contract', 'skip')`, saying why: here, the
+  `Auth` requests check the JWT gate on the bare `/api/v1/` scope, which documents no operation. **A generated API
+  points them at one of its operations and drops the opt-out**;
+- `Every secured operation refuses a missing JWT` replays every `jwt`-secured operation of the spec without a token
+  and expects a documented `401 text/plain`;
+- `OpenAPI coverage`, the last request, fails when an operation has no success case or a documented status above was
+  never answered, and when an entry of the collection variable `openapi_coverage_exceptions` (`"METHOD /path STATUS":
+  "reason"`, `2xx` for the success) is no longer needed.
+
+So a new endpoint fails the integration stack until the collection tests it. `endpoints::config` registers a
+`PathConfig`: a path id that does not parse answers `400 text/plain` `Invalid path: ids are integers.` (actix answers
+`404`), and `endpoints::headers::default_headers()` gives `text/plain; charset=utf-8` to the plain-text answers that
+set no content type.
+
+In those three stacks the API service is `image: ${IMAGE_REF}` (no `build:` block): CI sets `IMAGE_REF` to the
+published `ghcr.io/mairie360/<name>:dev-<sha>` image, and the scripts build `template-api:local` from
+`development.Dockerfile` when it is empty. That image is distroless (no shell, no curl), so readiness is a
+`template-ready` sidecar polling `/ready` that dependent services wait on (`service_completed_successfully`). Every
+stack sets `API_DOCS_ENABLED=true` (shared `x-common-env` anchor): without it the API serves neither Swagger UI nor
+`/api-docs/openapi.json`, which newman, ZAP and k6 read.
+
+The ZAP scan is authenticated and blocking: `security-scan` waits for the `seeder`, injects `ADMIN_JWT`
+(`sub=1`, an EdDSA token `security_test.sh` signs with the run's key, see `test_secrets.sh`) on every request
+and fails on any alert not set to `IGNORE` / `OUTOFSCOPE` in `.zap/rules.tsv` (no `-I`; the file is the same in
+every API). `-O http://<service>:<port>` is required, the spec's `servers` being unreachable from the ZAP
+container. ZAP fuzzes every field from the spec examples, so an example that does not deserialize or a `500`
+(value too long for its column, NUL byte, unmapped constraint violation) fails the job: fix the example or validate
+the input, don't silence the alert. Do not reject `<` / `>` in free text to please ZAP (MAIR-426): a value echoed
+in a JSON body served with `nosniff` is not an XSS, escaping is the front's job. If ZAP reports such a reflection,
+set that rule to `IGNORE` in `.zap/rules.tsv` with the reason, in every API.
+
+Both the ZAP and k6 stacks carry the OpenAPI coverage gate (MAIR-194) from mairie360/CICD `tests/`, available
+as `cicd-repo/` (checked out by CI, cloned by the scripts at the pinned `cicd_version` otherwise, override with
+`CICD_VERSION`; gitignored). ZAP runs with `--hook zap_hooks.py` and fails when an operation of the served spec was
+never reached, or when an operation requiring `jwt` only got 401/403. The auth rule relies on the spec:
+`endpoints/swagger.rs::SecurityAddon` declares the `jwt` bearer scheme (the name every API uses) at the top level
+and marks every operation outside `/api/` public (`security: []`), mirroring `main.rs`.
+
+Session tokens (MAIR-680): only Core_API signs them, with its Ed25519 key (`EdDSA`, `kid` = RFC 7638 thumbprint,
+`iss` `mairie360-core`, `aud` `mairie360`). An API only gets `JWT_PUBLIC_KEY` (Core's public key as PEM, several
+`PUBLIC KEY` blocks during a rotation, `\n`-escaped line breaks accepted) and checks them with the lib.
+Since lib 6.0.0 `JWT_PUBLIC_KEY` is required, `JWT_SECRET` is no longer read and every HS256 token is refused.
+The lib refuses to start without `JWT_PUBLIC_KEY` or with its committed test key. Tests sign their tokens like Core with the lib's test key
+pair (`tests/session_tokens/`, the process only holding `JWT_PUBLIC_KEY`); `tests/mair_680_jwt_config.rs` checks the
+public key alone is a valid configuration.
+
+- The dev stack (`docker-compose.yml`) defaults `JWT_PUBLIC_KEY` to the public half of the lib's test key pair
+  (`test_setup::http_setup::TEST_JWT_PUBLIC_KEY`) with `JWT_ALLOW_WEAK_SECRET: "true"`, which only that stack sets.
+  To call it, sign a token with the matching private key (in a subshell, so the keys do not stay exported):
+
+  ```bash
+  (export JWT_PRIVATE_KEY="$(openssl pkey -inform DER -in ~/.cargo/registry/src/*/mairie360_api_lib-4.5.0/src/test_setup/fixtures/session_test_key.der)"
+   export JWT_PUBLIC_KEY="$(printf '%s\n' "$JWT_PRIVATE_KEY" | openssl pkey -pubout)"
+   source ./test_secrets.sh && sign_jwt 1 admin 3600)
+  ```
+- The test stacks (integration, ZAP, k6, GDPR marker) require `JWT_PUBLIC_KEY` (`${JWT_PUBLIC_KEY:?…}`): their
+  `*_test.sh` script sources `test_secrets.sh`, which generates a fresh Ed25519 key pair per run, exports the public
+  key and signs the runners' tokens with the private one like Core does (`sign_jwt <sub> <role> <ttl> [key]`,
+  `sign_jwt_file` for k6, whose WebCrypto cannot sign Ed25519). The private key never reaches the API and nothing is
+  committed: run the scripts rather than `docker compose up` on those files.
+
+`load-test.js` is built on `coverage.js`: one handler per operation (`"METHOD /path"`), k6 aborts at init
+otherwise; the spec it reads is the one served by the image under test, saved into the `openapi-spec` volume by
+`template-ready`. Same shape as the five APIs (MAIR-195): the spec is split by HTTP method into a `reads` scenario
+(GET, ramp up to 20 VUs, against fixtures created in `setup()` and removed in `teardown()`) and a `writes` scenario
+(every other method, 2 VUs, each handler creating what it needs through `fixture()` and deleting it afterwards, so
+handlers are order-independent), one `p(95)` threshold per `op` tag (200 ms reads, 500 ms writes) and
+`http_req_failed < 1%`. k6 waits for the `seeder`, which runs with `ON_ERROR_STOP`. **Adding an endpoint = adding
+its handler in `load-test.js`** (`readHandlers` or `writeHandlers`), nothing to do for ZAP. Seed in `init-test.sql`
+the rows the spec's path examples point at (ZAP builds its requests from them) and only what the API cannot create.
+
+Every leaf handler is mounted as `#[get("/")]` (etc.) inside its segment scope, so its URL ends with `/`: its
+`#[utoipa::path]` must say `path = "/"` when the parent `doc.rs` nests it without a trailing slash, otherwise the
+spec documents a URL actix answers `404` to. `tests/routing_test.rs` checks every published operation against the
+mounted routes and catches it.
+
+
+Personal data stays out of the logs (MAIR-290): `request_log::request_logger()` replaces actix's
+`Logger::default()` (whose `%r` logs the query string), and a log describes an error by its type and
+context, never by the value it received. `gdpr_marker_test.sh` (`gdpr-marker.yaml` +
+`docker-compose-gdpr-marker.yml`, engine in mairie360/CICD `tests/gdpr/marker`, run by CICD's
+`gdpr_marker` job on the staging image) plays a journey with a marker user and fails when one of its
+values reaches a container log: a new API replaces the template's two steps with its own flows,
+deliberate errors included.
+## Layout
+
+- `src/main.rs` starts logs and traces with the lib's `init_telemetry`, builds `AppState` from `REDIS_URL` +
+  `DB_*` (the Postgres URL goes through `database::pg_url::build_pg_url`, which percent-encodes user, password and database name), serves Swagger UI at
+  `/swagger-ui/` and the spec at `/api-docs/openapi.json` (the ZAP scan target) only when `API_DOCS_ENABLED=true`
+  (never in production: consumers use the published package), mounts the public probes and
+  `endpoints::config` under `/api` wrapped in the lib's `JwtMiddleware` and, inside it, in `rate_limit_middleware` (per user: `RATE_LIMIT_PER_SECOND`, default 20, `0` disables it, `RATE_LIMIT_BURST`, default 50, `429` with `Retry-After`, counters per pod; the ZAP, k6 and GDPR stacks disable it; `RateLimitAddon` in `swagger.rs` documents the `429`). On a `429` the lib logs the limiter key at `warn` (`User(<internal id>)`, or the address of an anonymous caller): kept on purpose, a pseudonymous id lets operations spot who loops; logs are internal and short-lived.
+- `src/endpoints/health.rs`: `GET /health` is the liveness probe (always `200 OK`, no dependency checked, so a
+  Postgres outage does not restart every pod); `GET /ready` is the readiness probe (`SELECT 1` through
+  `database::ping` and a Redis read, 2 s timeout each, `503 not ready: <deps>` otherwise). Point Kubernetes'
+  `livenessProbe` at the first and `readinessProbe` at the second. At startup `main.rs` waits for Postgres
+  (`health::wait_for_postgres`, 10 tries about 30 s in all) and exits with an error when it never answers: the lib
+  would otherwise start without a pool and answer `500` to everything (MAIR-423). Since `mairie360_api_lib` 3.0
+`AppState::new` itself panics when Postgres stays unreachable for `DB_CONNECT_TIMEOUT` seconds, so a state cannot
+be built on an unreachable database (`tests/health_test.rs::startup_refuses_an_unreachable_postgres`). Redis stays optional at startup
+  (the cache degrades to Postgres), `/ready` still reports it.
+- `src/endpoints/` mirrors the URL path: each node has `mod.rs` (`config()`), and leaves have
+  `endpoint.rs` (handler + `trigger_*` + error enum implementing `ResponseError` and
+  `From<ApiLibError>`), `view.rs` (DTOs, private fields + getters) and `doc.rs` (utoipa), nested
+  up to `endpoints/swagger.rs::ApiDoc` (prefix `/api/v1`).
+- `src/endpoints/validation.rs`: request views with text fields implement `Validate` (length matching the
+  Postgres column, no control character; `<`, `>` and `&` are legitimate text) and handlers extract them with
+  `ValidatedJson` / `ValidatedQuery` instead of `web::Json` / `web::Query`, which answer `400` naming the field.
+  Map the lib's `DbError::ForeignKeyViolation` / `UniqueViolation` to `4xx`, never `500`: call
+  `endpoints::db_error::classify_db_error("<resource>/<op>", &e)` and map each `DbFailure` (`NotFound`, `Conflict`,
+  `InvalidReference`, `Internal`) to a variant of the handler's error enum. Never `.map_err(|_| ...)`: the
+  helper logs the cause, `Internal` at `error` (MAIR-421).
+- Logs go through `tracing`, set up by the lib's `init_telemetry` (see "Logs and observability" below), which
+  also carries actix's request log. No `println!` / `eprintln!` in new code. Responses carry
+  `X-Content-Type-Options: nosniff` (`DefaultHeaders` in `main.rs`).
+- Ids: path and body ids are `u64` in the API and `INT4` in Postgres. Convert with the lib's `id_to_sql` /
+  `id_from_sql` (or `i32::try_from` answering `400`), never `as i32`: `2^32 + 1` would wrap to `1` and alias
+  another row (MAIR-422). `lib.rs` and `main.rs` deny `clippy::cast_possible_truncation`, `cast_possible_wrap`
+  and `cast_sign_loss`, so `cargo check_code` refuses the cast; do not silence them.
+- Lists are bounded (MAIR-425): a list route takes `endpoints::pagination::PageParams` (`limit` 1-500, default
+  100, `offset`) and runs `LIMIT` / `OFFSET` from `page()`, answering the page plus `total`; a feed that grows
+  forever (messages, history) pages by cursor instead; a time-range query caps the width of the range. Rate
+  limiting is not done per API: every call comes from a BFF, so a per-IP limit here would throttle all users at
+  once. It belongs to the ingress / BFF layer.
+- `src/database/<resource>/<op>/view.rs`: query views implementing `ApiRequestDto`, run through
+  `state.get_smart_db()`. `fetch_one`/`fetch_all` SQL must return one JSON column
+  (`SELECT to_jsonb(t) FROM (...) t`).
+- A write spanning several queries, and an access check followed by the action it guards, runs in one
+  transaction (MAIR-420): `let mut tx = state.get_smart_db().begin().await?;`, the queries on `tx`, then
+  `tx.commit().await?`. An early `?` drops `tx` and rolls back what already ran; never compensate by hand with a
+  `DELETE` whose error is ignored. A single CTE statement is fine too. `tests/transaction_test.rs` is the example.
+
+## Logs and observability (MAIR-503)
+
+Logs and traces come from `mairie360_api_lib::logging::telemetry` (feature `otel`), shared by every API: `main.rs`
+only calls `init_telemetry("template-api")` (`change api name`: the API's service name, e.g. `project-api`) first
+thing and keeps the guard until exit. Read the lib for the details.
+
+- Logs on stdout in the format of every API: coloured text (`RUST_LOG`, default `info`), one JSON object per line
+  with `LOG_FORMAT=json`. The request root span is hidden from them (it holds the client address and query string).
+- Traces over OTLP/HTTP, opt-in: nothing is exported unless `OTEL_EXPORTER_OTLP_ENDPOINT` (or
+  `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) is set, `OTEL_SDK_DISABLED=true` forces it off, a failing exporter is
+  logged and never stops the API. The endpoint is an agent relaying to Scaleway Cockpit (OTel Collector or Grafana
+  Alloy, e.g. `http://alloy:4318`); `OTEL_SERVICE_NAME` defaults to the name given to `init_telemetry`. The
+  commented block of `docker-compose.yml` shows the variables.
+- `main.rs` wraps the app in the lib's `TracingLogger` next to the request log (`middleware::Logger`, kept), so
+  requests refused by `JwtMiddleware` get a span too. Root spans are named `<METHOD> <route pattern>` and continue
+  an incoming `traceparent`. The SQL appears as span **events** (`db.statement` with `$n` placeholders, never the
+  values). The lib's `Redact` drops `http.client_ip` and the query string before export: build test providers with
+  `telemetry::tracer_provider`, never `SdkTracerProvider::builder()`.
+- Never add `opentelemetry*` / `tracing-actix-web` / `tracing-opentelemetry` to `Cargo.toml`: use the lib's
+  re-exports (`telemetry::opentelemetry`, `telemetry::opentelemetry_sdk`), its versions are coupled.
+  `tracing-subscriber` is only a dev-dependency, for the test subscriber.
+- `tests/telemetry_test.rs` asserts the span of a request through `TracingLogger` and the JWT gate (status, route,
+  continued trace id, no query string, no client address) and of a `401`. A new API points it at one of its routes
+  and also checks the SQL events (see Project API's `tests/endpoints/telemetry.rs`); the redaction of logs and spans
+  is tested in the lib.
+
+## CI and Renovate
+
+`.github/workflows/cicd.yml` calls `mairie360/CICD` `APIs_cicd.yml` on pull requests (lint, build, tests) and
+on pushes to `main` (plus releases and the three stacks). Its `integration_tests`,
+`integration_and_security` and `performance_isolated` jobs run the three `*_test.sh` scripts with
+`IMAGE_REF` set to the `dev-<sha>` image published by `release-dev`; no Postman variable or secret is needed. `renovate.json` deliberately
+overrides the org preset to automerge everything (majors, 0.x, prod `Dockerfile`) with
+`ignoreTests: true` and `platformAutomerge: false`, so PRs merge even when CI fails. That is
+template-only: real APIs keep the standard config (org preset + `cicd_version` custom manager),
+and the README tells new APIs to swap it back. Don't propagate the automerge-all file to siblings.
+
+`auto-approve.yml` calls the reusable auto-approval of mairie360/CICD (same tag on `uses:` and `cicd_version`), which approves a Renovate PR only while Renovate alone wrote and pushed it and takes the approval back after any other push; `pull-requests: write` only (`tests/mair_685_auto_approve.rs`). Both `Dockerfile`s pin their base
+images by digest (`tests/dockerfile_test.rs` enforces it) and build with `--locked`; the production one builds
+the dependencies in their own cached layer first (MAIR-427). Every advisory ignored in `.cargo/audit.toml` carries
+a comment saying why it does not apply and when to drop it: no bare ignore, and a patched version is taken with
+`cargo update -p <crate>` rather than ignored.
+
+## Pull request reviewers
+
+Every PR requests a review from the whole team, minus its author: `CarolinHugo`, `LAURETbenjamin`, `MathTek` and `Quentintnrl` (`gh pr create … --reviewer CarolinHugo,LAURETbenjamin,MathTek`). `.github/CODEOWNERS` makes GitHub request them automatically as well.
+
+## Postgres pool settings (MAIR-565)
+
+`mairie360_api_lib`'s `Database` (since 3.4.0) reads three optional env vars through `DbPoolConfig::from_env`:
+`DB_POOL_MIN_CONNECTIONS` (default 1, sqlx's was 0: the API keeps one connection open, so the first request after a
+pause no longer reconnects), `DB_POOL_MAX_CONNECTIONS` (default 10) and `DB_POOL_IDLE_TIMEOUT_SECS` (default 600). An
+invalid value falls back to its default with a `warn!`. Per-instance values are set by the `Deploiment` chart
+(`APIs.dbPool`); the compose stacks set none and use the defaults. Nothing to wire in the template: the lib does it.

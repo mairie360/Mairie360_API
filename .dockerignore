@@ -1,0 +1,44 @@
+# Target directory (compiled files)
+target
+
+# Build artifacts
+*.rlib
+*.rmeta
+*.dSYM/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Debug and log files
+*.log
+
+# Misc
+.DS_Store
+*.pem
+
+# Environment files (if any)
+.env*
+
+# IDE/editor settings
+.vscode/
+.idea/
+
+# Cargo package registry and git dependencies (optional)
+.cargo/
+.git/
+
+# Docker files
+.dockerignore
+Dockerfile
+development.Dockerfile
+
+# GDPR log marker test (MAIR-290)
+gdpr-report
+gdpr-simulation
+gdpr-marker.yaml
+gdpr_marker_test.sh
+docker-compose-gdpr-marker.yml
+gdpr-simulation.yaml
+gdpr_simulation_test.sh
+docker-compose-gdpr-simulation.yml

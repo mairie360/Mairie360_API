@@ -1,0 +1,25 @@
+[alias]
+
+#This alias check the lint
+lint_check = "fmt --all -- --check"
+
+# This alias formats the code
+lint_fix = "fmt --all"
+
+# This alias check the code
+check_code = "clippy --all-targets --all-features -- -D warnings"
+
+# This alias generate the OpenAPI documentation
+open_api = "run --example generate_openapi"
+
+cov_test = ["llvm-cov", "--workspace", "--ignore-filename-regex", "main\\.rs|lib\\.rs", "--fail-under-lines", "60"]
+
+cov = ["llvm-cov", "--workspace", "--ignore-filename-regex", "main\\.rs|lib\\.rs", "--fail-under-lines", "60", "--codecov", "--output-path", "codecov.json"]
+
+# Tag of the ghcr.io/mairie360/database and liquibase-migrations images the tests start
+# (mairie360_api_lib::test_setup): `dev`, the stage of the cargo tests, like the compose stacks
+# outside the promotions (MAIR-998: nothing to re-pin when the Database releases).
+# mairie360_api_lib passes -Dallow_template_admin=true where the migration needs it. An
+# exported TEST_DB_VERSION still wins.
+[env]
+TEST_DB_VERSION = "dev"

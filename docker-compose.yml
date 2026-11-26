@@ -1,0 +1,166 @@
+volumes:
+  postgres-data:
+  redis-data:
+  template-target: # change api name
+
+networks:
+  backend:
+
+x-common-env: &common-env
+  HOST: "0.0.0.0"
+  PORT: 3000 # change port
+  REDIS_URL: redis://redis:6379
+  DB_TYPE: postgres
+  DB_NAME: mairie_360_database
+  # The API connects with its own role, like in staging/prod (MAIR-556): a query its grants do not
+  # cover fails here. The superuser stays for postgres, liquibase and the seeder.
+  DB_USER: core_api # change api role (<api>_api, see Database's api_roles.sql)
+  DB_HOST: postgres
+  DB_PASSWORD: core-api-password # change api role
+  DB_PORT: 5432
+  # Logs: coloured text by default, `LOG_FORMAT: json` for one JSON object per line (MAIR-503).
+  # LOG_FORMAT: json
+  # OpenTelemetry traces (MAIR-503), off unless an OTLP/HTTP endpoint is set, e.g. a local
+  # collector listening on the host: OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4318
+  # OTEL_SERVICE_NAME: template-api # change api name
+  # Serves Swagger UI and /api-docs/openapi.json: dev and test stacks only, never production.
+  API_DOCS_ENABLED: "true"
+
+services:
+  postgres:
+    image: ghcr.io/mairie360/database:${UPSTREAM_TAG:-dev}
+    pull_policy: ${UPSTREAM_PULL_POLICY:-always}
+    restart: always
+    container_name: mairie360-db-template-api # change api name
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+      POSTGRES_DB: mairie_360_database
+    expose:
+      - "5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  liquibase:
+    image: ghcr.io/mairie360/liquibase-migrations:${UPSTREAM_TAG:-dev}
+    pull_policy: ${UPSTREAM_PULL_POLICY:-always}
+    container_name: mairie360-liquibase-template-api # change api name
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      LIQUIBASE_COMMAND_URL: jdbc:postgresql://postgres:5432/mairie_360_database
+      LIQUIBASE_COMMAND_USERNAME: ${DB_USER:-postgres}
+      LIQUIBASE_COMMAND_PASSWORD: ${DB_PASSWORD:-password}
+      LIQUIBASE_SEARCH_PATH: /migrations
+    # Database >= MAIR-413 refuses to seed the admin (users.id = 1) without credentials: this
+    # throwaway stack uses the public template admin. Never pass the flag on a real instance.
+    command: >
+      --changelog-file=changelog.xml
+      update
+      -Dallow_template_admin=true
+      -Dcore_api_password=core-api-password
+    networks:
+      - backend
+
+  seeder:
+    image: postgres:19-alpine@sha256:cac45fb483caee3668946088a1c0532db89d5285c28dbfeac889b4068296e06f
+    depends_on:
+      liquibase:
+        condition: service_completed_successfully
+    volumes:
+      - ./init-test.sql:/init-test.sql
+    # On se connecte directement au service 'postgres' via son nom de service
+    command: >
+      sh -c "psql -h postgres -U postgres -d mairie_360_database -f /init-test.sql"
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:-password}
+    networks:
+      - backend
+
+  redis:
+    image: redis:8.4.0-bookworm@sha256:c22af04bb576503bf16b3e34a1fd2fd82de0f765afd866d2e380145e0af30d78
+    container_name: mairie360-redis-template-api # change api name
+    restart: always
+    expose:
+      - "6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  template: # change api name
+    container_name: template_api-developpement # change api name
+    build:
+      context: .
+      dockerfile: development.Dockerfile
+    develop:
+      watch:
+        - action: sync
+          path: ./src
+          target: /usr/src/template/src # change api name
+        - action: sync
+          path: ./Cargo.toml
+          target: /usr/src/template/Cargo.toml # change api name
+        - action: sync
+          path: ./Cargo.lock
+          target: /usr/src/template/Cargo.lock # change api name
+    ports:
+      - "3000:3000" # change port
+    volumes:
+      - template-target:/usr/src/template/target # change api name
+    networks:
+      - backend
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      <<: *common-env
+      PUBLIC_URL: http://template.development.mairie360.fr # change api name
+      JWT_TIMEOUT: 3600
+      # MAIR-680: Core's public key only, no JWT_SECRET (HS256 tokens are refused). Defaults to the
+      # public half of mairie360_api_lib's test key pair (test_setup::http_setup), which the lib
+      # refuses at startup unless JWT_ALLOW_WEAK_SECRET is set: dev stack only, never a deployment.
+      # Sign dev tokens with that pair, see CLAUDE.md ("Session tokens"), or export your own
+      # JWT_PUBLIC_KEY before `docker compose up`.
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:------BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAKW8bV4kiFUo8hmOEU3+lXdqZL1wmKvBw6smUyjpmXks=\n-----END PUBLIC KEY-----}
+      JWT_ALLOW_WEAK_SECRET: "true"
+    depends_on:
+      liquibase:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://template:3000/ready"] # change api name and port
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+  nginx:
+    image: nginx:1.29.1-bookworm@sha256:8adbdcb969e2676478ee2c7ad333956f0c8e0e4c5a7463f4611d7a2e7a7ff5dc
+    restart: always
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    ports:
+      - "80:80"
+    networks:
+      - backend
+    depends_on:
+      template: # change api name
+        condition: service_healthy
+    extra_hosts:
+      - "template.development.mairie360.fr:127.0.0.1" # change api name
